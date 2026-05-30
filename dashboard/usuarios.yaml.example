@@ -1,0 +1,16 @@
+# Copiar este archivo como usuarios.yaml en la misma carpeta
+# Las contraseñas deben ser hashes bcrypt, NO texto plano.
+# Para agregar usuarios usa: python agregar_usuario.py
+
+credentials:
+  usernames:
+    admin:
+      name: Administrador
+      email: admin@tuempresa.com
+      password: $2b$12$HASH_GENERADO_POR_BCRYPT
+      role: admin
+    operador:
+      name: Operador
+      email: operador@tuempresa.com
+      password: $2b$12$HASH_GENERADO_POR_BCRYPT
+      role: user
