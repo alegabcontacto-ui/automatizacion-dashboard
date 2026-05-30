@@ -1,0 +1,45 @@
+# ── Secretos ──────────────────────────────────────
+.env
+*.env
+
+# ── PDFs y archivos generados ──────────────────────
+automatizacion/cotizaciones_generadas/
+automatizacion/cotizaciones_generadas_backup/
+**/*.pdf
+
+# ── Logs y estado interno ──────────────────────────
+*.log
+estado_procesamiento.json
+
+# ── Adjuntos temporales descargados de Outlook ─────
+automatizacion/adjuntos_temp/
+*.xlsx
+*.xls
+
+# ── Python ────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+env/
+*.egg-info/
+dist/
+build/
+
+# ── Backups CSV ───────────────────────────────────
+*_backup_*.csv
+cotizaciones_backup/
+cotizaciones_imss_*.csv
+
+# ── Credenciales de usuarios del dashboard ─────────
+dashboard/usuarios.yaml
+
+# ── Archivos locales de herramientas ──────────────
+.remember.json
+.claude/
+
+# ── Sistema operativo ──────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
