@@ -825,7 +825,7 @@ def _html_solo_respuesta_nueva(html: str) -> str:
 
 # ── EXTRACCIÓN DE TABLAS HTML ────────────────────────────────────────────────
 
-_PREFIJOS_REENVIO = ("rv:", "fwd:", "fw:", "reenvio:", "reenvío:", "tr:", "re: rv:", "re: fwd:")
+_PREFIJOS_REENVIO = ("rv:", "fwd:", "fw:", "reenvio:", "reenvío:", "tr:", "re: rv:", "re: fwd:", "re: re:")
 
 
 def _es_reenvio(message) -> bool:
