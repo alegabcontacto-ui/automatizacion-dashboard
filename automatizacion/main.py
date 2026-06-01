@@ -112,12 +112,25 @@ def guardar_estado(estado: dict):
 #  EXPEDIENTE Y PARTIDA
 # ─────────────────────────────────────────────
 
+# Contador en memoria para fallback sin MySQL (se reinicia al reiniciar el proceso)
+_fallback_consecutivo: dict = {}
+
+
+def _formato_expediente(fecha_hoy, consecutivo: int) -> str:
+    dd  = str(fecha_hoy.day).zfill(2)
+    mm  = str(fecha_hoy.month).zfill(2)
+    yy  = str(fecha_hoy.year)[-2:]
+    año = str(fecha_hoy.year)
+    return f"I-{año}-{dd}{mm}{yy}{consecutivo}"
+
+
 def generar_expediente(conn, fecha: datetime) -> str:
     fecha_hoy = fecha.date() if hasattr(fecha, "date") else datetime.now().date()
 
     if conn is None or not conn.is_connected():
-        ts = datetime.now().strftime("%d%m%y")
-        return f"I-{datetime.now().year}-{ts}1"
+        # Fallback: contador en memoria, único dentro del proceso y con formato correcto
+        _fallback_consecutivo[fecha_hoy] = _fallback_consecutivo.get(fecha_hoy, 0) + 1
+        return _formato_expediente(fecha_hoy, _fallback_consecutivo[fecha_hoy])
 
     cursor = conn.cursor()
     try:
@@ -145,11 +158,26 @@ def generar_expediente(conn, fecha: datetime) -> str:
     finally:
         cursor.close()
 
-    dd  = str(fecha_hoy.day).zfill(2)
-    mm  = str(fecha_hoy.month).zfill(2)
-    yy  = str(fecha_hoy.year)[-2:]
-    año = str(fecha_hoy.year)
-    return f"I-{año}-{dd}{mm}{yy}{consecutivo}"
+    return _formato_expediente(fecha_hoy, consecutivo)
+
+
+def revertir_expediente(conn, fecha: datetime) -> None:
+    """Decrementa el consecutivo cuando un expediente fue asignado pero el correo falló."""
+    if conn is None:
+        return
+    fecha_hoy = fecha.date() if hasattr(fecha, "date") else datetime.now().date()
+    cursor = conn.cursor()
+    try:
+        cursor.execute(
+            "UPDATE expediente_consecutivo SET consecutivo = consecutivo - 1 "
+            "WHERE fecha = %s AND consecutivo > 1",
+            (fecha_hoy,)
+        )
+        conn.commit()
+    except Exception as e:
+        log.warning(f"revertir_expediente falló: {e}")
+    finally:
+        cursor.close()
 
 
 def generar_clave(gpo, gen, esp, dif, var) -> str:
@@ -235,6 +263,12 @@ def limpiar_mysql_por_fechas(conn, fecha_desde: datetime, fecha_hasta: datetime)
              fecha_hasta.strftime("%Y-%m-%d 23:59:59")),
         )
         log.info(f"MySQL cotizaciones eliminadas: {cursor.rowcount} registro(s)")
+        cursor.execute(
+            "DELETE FROM correos_procesados WHERE fecha_correo BETWEEN %s AND %s",
+            (fecha_desde.strftime("%Y-%m-%d 00:00:00"),
+             fecha_hasta.strftime("%Y-%m-%d 23:59:59")),
+        )
+        log.info(f"MySQL correos_procesados eliminados: {cursor.rowcount} registro(s)")
         dia = fecha_desde.date()
         while dia <= fecha_hasta.date():
             cursor.execute("DELETE FROM expediente_consecutivo WHERE fecha = %s", (dia,))
@@ -263,7 +297,7 @@ def insertar_filas(conn, df: pd.DataFrame) -> int:
 
     for _, row in df.iterrows():
         hash_fila = hashlib.md5(
-            f"{row['REMITENTE']}{row['ASUNTO']}{row['GPO']}{row['GEN']}"
+            f"{row['EXPEDIENTE']}{row['REMITENTE']}{row['ASUNTO']}{row['GPO']}{row['GEN']}"
             f"{row['ESP']}{row['DIF']}{row['VAR']}{row['CANTIDAD']}".encode()
         ).hexdigest()
 
@@ -480,6 +514,8 @@ EQUIVALENCIAS_COLUMNAS = {
     "solicitado": "CANTIDAD", "cantidad_solicitada": "CANTIDAD",
     "cantidad_autorizada": "CANTIDAD", "cantidad_requerida": "CANTIDAD",
     "requerida": "CANTIDAD", "cant_requerida": "CANTIDAD",
+    "solicit": "CANTIDAD", "solicitud": "CANTIDAD",
+    "cant_solicitada": "CANTIDAD", "cant_solicit": "CANTIDAD",
     "total": "CANTIDAD",
     # "unidad" removido: en tablas IMSS UNIDAD es código de hospital, no cantidad
     "ingreso": "CANTIDAD",   # columna INGRESO usada como cantidad en formato FOLIO/UNIDAD
@@ -504,6 +540,7 @@ def detectar_fila_encabezado(df: pd.DataFrame):
         tiene_esp  = any(p in texto for p in ["esp", "especifico"])
         tiene_cant = any(p in texto for p in [
             "cantidad", "piezas", "necesidad", "solicitado",
+            "solicit", "solicitud",
             "total", "unidad", "faltante", "medicamento_faltante",
             "ingreso",
         ])
@@ -529,16 +566,17 @@ def _asignar_dif_var_posicional(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def filtrar_formato_clave(df: pd.DataFrame) -> pd.DataFrame:
-    mascara = (
-        df["GPO"].apply(lambda x: bool(re.fullmatch(r"\d{3}", str(x).strip()))) &
-        df["GEN"].apply(lambda x: bool(re.fullmatch(r"\d{3}", str(x).strip()))) &
-        df["ESP"].apply(lambda x: bool(re.fullmatch(r"\d{4}", str(x).strip()))) &
-        df["DIF"].apply(lambda x: bool(re.fullmatch(r"\d{2}", str(x).strip()))) &
-        df["VAR"].apply(lambda x: bool(re.fullmatch(r"\d{2}", str(x).strip())))
-    )
+    m_gpo = df["GPO"].apply(lambda x: bool(re.fullmatch(r"\d{3}", str(x).strip())))
+    m_gen = df["GEN"].apply(lambda x: bool(re.fullmatch(r"\d{3}", str(x).strip())))
+    m_esp = df["ESP"].apply(lambda x: bool(re.fullmatch(r"\d{4}", str(x).strip())))
+    m_dif = df["DIF"].apply(lambda x: bool(re.fullmatch(r"\d{2}", str(x).strip())))
+    m_var = df["VAR"].apply(lambda x: bool(re.fullmatch(r"\d{2}", str(x).strip())))
+    mascara = m_gpo & m_gen & m_esp & m_dif & m_var
     descartadas = (~mascara).sum()
     if descartadas:
-        log.warning(f"filtrar_formato_clave: {descartadas} fila(s) descartada(s) por formato incorrecto.")
+        cols_fallo = [c for c, m in [("GPO",m_gpo),("GEN",m_gen),("ESP",m_esp),("DIF",m_dif),("VAR",m_var)] if not m.all()]
+        vals_muestra = df.loc[~mascara, ["GPO","GEN","ESP","DIF","VAR"]].head(3).to_dict("records")
+        log.warning(f"filtrar_formato_clave: {descartadas} fila(s) descartada(s). Columnas con error: {cols_fallo}. Muestra: {vals_muestra}")
     return df[mascara].reset_index(drop=True)
 
 
@@ -602,20 +640,41 @@ def limpiar_tabla_con_encabezado(df_original: pd.DataFrame):
             df[col] = ""
 
     df = df[["GPO", "GEN", "ESP", "DIF", "VAR", "CANTIDAD"]]
+
+    # Reparar antes del filtro de vacíos: columna GEN con 4 dígitos y ESP ausente
+    # significa que la tabla omitió la columna ESP y puso el específico en GEN.
+    _gen4_pre = df["GEN"].astype(str).str.strip().apply(lambda x: bool(re.fullmatch(r"\d{4}", x)))
+    _esp_vacia = df["ESP"].astype(str).str.strip().eq("")
+    _fix_pre = _gen4_pre & _esp_vacia
+    if _fix_pre.any():
+        df.loc[_fix_pre, "ESP"] = df.loc[_fix_pre, "GEN"]
+        df.loc[_fix_pre, "GEN"] = "0"
+        log.info(f"GEN→ESP reparado (columna GEN contenía específico de 4 dígitos): {_fix_pre.sum()} fila(s).")
+
     df = df[df["GPO"].astype(str).str.strip().ne("") & df["ESP"].astype(str).str.strip().ne("")]
     df = df[df["GPO"].apply(lambda x: limpiar_texto(str(x)) != "gpo")]
 
-    df["GPO"] = df["GPO"].astype(str).str.strip().str.zfill(3)
-    df["GEN"] = df["GEN"].astype(str).str.strip().str.zfill(3)
-    df["ESP"] = df["ESP"].astype(str).str.strip().str.zfill(4)
-    df["DIF"] = df["DIF"].astype(str).str.strip().str.zfill(2)
-    df["VAR"] = df["VAR"].astype(str).str.strip().str.zfill(2)
+    def _norm_int(v):
+        s = str(v).strip()
+        try:
+            return str(int(float(s))) if s else s
+        except (ValueError, OverflowError):
+            return s
+
+    df["GPO"] = df["GPO"].apply(_norm_int).str.zfill(3)
+    df["GEN"] = df["GEN"].apply(_norm_int).str.zfill(3)
+    df["ESP"] = df["ESP"].apply(_norm_int).str.zfill(4)
+    df["DIF"] = df["DIF"].apply(_norm_int).str.zfill(2)
+    df["VAR"] = df["VAR"].apply(_norm_int).str.zfill(2)
+
     df = filtrar_formato_clave(df)
 
-    df["CANTIDAD"] = (
-        df["CANTIDAD"].astype(str)
-        .apply(lambda x: max(re.findall(r"\d+", x), key=len, default=""))
-    )
+    def _extraer_cantidad(v: str) -> str:
+        # Ignorar secuencias de 9+ dígitos: probablemente claves concatenadas, no cantidades
+        validas = [s for s in re.findall(r"\d+", str(v)) if len(s) <= 8]
+        return max(validas, key=len, default="")
+
+    df["CANTIDAD"] = df["CANTIDAD"].astype(str).apply(_extraer_cantidad)
     df = df[df["CANTIDAD"].str.strip().ne("")]
     return df if not df.empty else None
 
@@ -636,7 +695,10 @@ def extraer_numero(v: str) -> str:
     if _RE_AÑO.match(s) and 1900 <= int(s) <= 2100:
         return ""
     m = re.search(r"\d+", s)
-    return m.group(0) if m else ""
+    if not m:
+        return ""
+    # Ignorar secuencias de 9+ dígitos: probablemente clave concatenada, no cantidad
+    return m.group(0) if len(m.group(0)) <= 8 else ""
 
 
 def limpiar_tabla_sin_encabezado(df_original: pd.DataFrame):
@@ -967,53 +1029,63 @@ def procesar_correos(inbox, conn, ids_procesados: set, ultima_fecha,
                 continue
 
             expediente = generar_expediente(conn, fecha_correo)
+            expediente_usado = False
+            try:
+                # Partida consecutiva sobre el total de filas de todas las tablas
+                df_correo["PARTIDA"] = range(1, len(df_correo) + 1)
+                df_correo["CLAVE"]   = df_correo.apply(
+                    lambda r: generar_clave(r["GPO"], r["GEN"], r["ESP"], r["DIF"], r["VAR"]),
+                    axis=1,
+                )
+                df_correo["EXPEDIENTE"]   = expediente
+                df_correo["ASUNTO"]       = asunto
+                df_correo["REMITENTE"]    = remitente_real
+                df_correo["FECHA_CORREO"] = str(fecha_correo)
+                df_correo = df_correo[COLUMNAS_FINALES]
 
-            # Partida consecutiva sobre el total de filas de todas las tablas
-            df_correo["PARTIDA"] = range(1, len(df_correo) + 1)
-            df_correo["CLAVE"]   = df_correo.apply(
-                lambda r: generar_clave(r["GPO"], r["GEN"], r["ESP"], r["DIF"], r["VAR"]),
-                axis=1,
-            )
-            df_correo["EXPEDIENTE"]   = expediente
-            df_correo["ASUNTO"]       = asunto
-            df_correo["REMITENTE"]    = remitente_real
-            df_correo["FECHA_CORREO"] = str(fecha_correo)
-            df_correo = df_correo[COLUMNAS_FINALES]
+                correos_con_tabla += 1
+                resultados_csv.append(df_correo)
 
-            correos_con_tabla += 1
-            resultados_csv.append(df_correo)
+                log.info(f"Expediente : {expediente}")
+                log.info(f"Filas total: {len(df_correo)}")
+                log.info(f"\n{df_correo[['EXPEDIENTE','PARTIDA','GPO','GEN','ESP','DIF','VAR','CANTIDAD','CLAVE']].to_string(index=False)}")
 
-            log.info(f"Expediente : {expediente}")
-            log.info(f"Filas total: {len(df_correo)}")
-            log.info(f"\n{df_correo[['EXPEDIENTE','PARTIDA','GPO','GEN','ESP','DIF','VAR','CANTIDAD','CLAVE']].to_string(index=False)}")
-
-            filas_insertadas_correo = 0
-            if conn is not None:
-                try:
-                    if not conn.is_connected():
-                        conn = conectar_mysql()
-                    if conn:
-                        filas_insertadas_correo = insertar_filas(conn, df_correo)
-                        total_insertadas += filas_insertadas_correo
-                        log.info(f"Insertadas en MySQL: {filas_insertadas_correo}")
-                except Exception as e:
-                    log.error(f"Error insertando en MySQL: {e}", exc_info=True)
-
-            actualizar_correo_estado(
-                conn, entry_id, 'completado',
-                len(df_correo), filas_insertadas_correo, expediente,
-                remitente_imss=remitente_real,
-            )
-            ids_procesados.add(entry_id)
-
-            if COTIZACION_DISPONIBLE:
-                firma = (remitente_real, frozenset(df_correo["CLAVE"].tolist()))
-                if firma not in firmas_cotizadas:
-                    firmas_cotizadas.add(firma)
+                filas_insertadas_correo = 0
+                if conn is not None:
                     try:
-                        generar_y_enviar_cotizacion(message, df_correo, asunto, fecha_correo)
-                    except Exception as e_cot:
-                        log.error(f"Error generando cotización: {e_cot}", exc_info=True)
+                        if not conn.is_connected():
+                            conn = conectar_mysql()
+                        if conn:
+                            filas_insertadas_correo = insertar_filas(conn, df_correo)
+                            total_insertadas += filas_insertadas_correo
+                            log.info(f"Insertadas en MySQL: {filas_insertadas_correo}")
+                    except Exception as e:
+                        log.error(f"Error insertando en MySQL: {e}", exc_info=True)
+
+                expediente_usado = True
+                actualizar_correo_estado(
+                    conn, entry_id, 'completado',
+                    len(df_correo), filas_insertadas_correo, expediente,
+                    remitente_imss=remitente_real,
+                )
+                ids_procesados.add(entry_id)
+
+                if COTIZACION_DISPONIBLE:
+                    firma = (remitente_real, frozenset(
+                        (row["CLAVE"], str(row["CANTIDAD"])) for _, row in df_correo.iterrows()
+                    ))
+                    if firma not in firmas_cotizadas:
+                        firmas_cotizadas.add(firma)
+                        try:
+                            generar_y_enviar_cotizacion(message, df_correo, asunto, fecha_correo)
+                        except Exception as e_cot:
+                            log.error(f"Error generando cotización: {e_cot}", exc_info=True)
+
+            except Exception as e_inner:
+                if not expediente_usado:
+                    revertir_expediente(conn, fecha_correo)
+                    log.warning(f"Expediente {expediente} revertido por error post-asignación: {e_inner}")
+                raise
 
         except Exception as e:
             log.error(f"Error procesando correo: {e}", exc_info=True)
