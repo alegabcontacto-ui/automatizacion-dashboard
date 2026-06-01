@@ -259,3 +259,97 @@ Se realizaron múltiples reprocesares durante la sesión de depuración, cada un
 - Para reprocesar un día: `python main.py --desde YYYY-MM-DD --hasta YYYY-MM-DD`
 - Los PDFs se guardan en `cotizaciones_generadas/` con nombre `Cotizacion_YYYYMMDD_HHMMSS.pdf`
 - Cada PDF tiene un sidecar `.json` con metadatos del envío
+- Los CSVs `cotizaciones_imss_*.csv` son solo respaldo — el dashboard NO los usa, se pueden borrar sin impacto
+
+---
+
+## Cómo revisar el log
+
+El log principal es `cotizaciones.log` (~8MB+). Para ver las últimas líneas:
+```powershell
+Get-Content cotizaciones.log -Tail 30
+```
+
+Para buscar un correo específico por remitente o asunto:
+```powershell
+Select-String -Path cotizaciones.log -Pattern "vidal.rodriguez|UMF 24" | Select-Object -ExpandProperty Line
+```
+
+**Indicadores clave en el log:**
+- `CORREO VÁLIDO #N` → correo que pasó los filtros de validación
+- `Tablas HTML válidas encontradas: N` → tabla detectada en el cuerpo HTML
+- `Reenvío sin tabla en parte reciente — intentando primer bloque reenviado` → correo reenviado, buscando en bloque original
+- `GEN→ESP reparado` → se aplicó la corrección de columna GEN con 4 dígitos
+- `filtrar_formato_clave: N fila(s) descartadas. Columnas con error: [...]` → filas con formato incorrecto, el log ahora muestra qué columna falla y muestra 3 valores de ejemplo
+- `Sin tabla válida (cuerpo ni adjuntos)` → correo sin tabla procesable
+- `Insertadas en MySQL: N` → filas guardadas exitosamente
+- `Expediente X revertido` → el consecutivo se decrementó porque hubo error post-asignación
+- `Próxima revisión en 120s` → ciclo terminado, monitor esperando
+
+---
+
+## Cómo enviar un PDF manualmente por Outlook
+
+Si necesitas reenviar un PDF de cotización generado a un correo específico:
+```powershell
+$pdf = "ruta\completa\al\Cotizacion_YYYYMMDD_HHMMSS.pdf"
+$outlook = New-Object -ComObject Outlook.Application
+$mail = $outlook.CreateItem(0)
+$mail.To = "destinatario@ejemplo.com"
+$mail.Subject = "RE: ASUNTO DEL CORREO — Cotización ADEMEX"
+$mail.HTMLBody = "<p>Buen día, adjunto la cotización.</p>"
+$mail.Attachments.Add($pdf) | Out-Null
+$mail.Send()
+```
+
+---
+
+## Revisión completa de robustez (2026-06-01)
+
+Se realizó una revisión exhaustiva del código. Bugs encontrados en total: 14.
+
+### Bugs corregidos en la sesión (9)
+Ver sección "Bugs corregidos" más arriba.
+
+### Bugs pendientes priorizados (5)
+
+**🔴 Críticos:**
+1. **Tabla `cotizaciones` no se auto-crea** — `asegurar_tablas_mysql()` solo crea `correos_procesados` y `expediente_consecutivo`. En instalación nueva el monitor falla silenciosamente fila por fila.
+2. **Sin reconexión a Outlook COM** — `inbox` se obtiene una sola vez al arrancar. Si Outlook se cierra/reinicia, todas las iteraciones siguientes fallan con error COM capturado silenciosamente. El programa sigue vivo pero no procesa nada.
+
+**🟠 Altos:**
+3. **`estado_procesamiento.json` crece sin límite** — Ya ~339KB con miles de entry_ids. Se serializa completo cada 2 minutos. En meses será lento.
+4. **Bug de timezone** — Línea 949: `fecha_correo <= ultima_fecha` puede lanzar `TypeError` si uno es timezone-aware y el otro naive.
+5. **Rendimiento: itera todo el inbox cada ciclo** — Sin `Restrict` por fecha, con miles de correos cada revisión escanea todo.
+
+**🟢 Bajos:**
+- CSVs sin rotación ni límite
+- Firmante `"JUAN PÉREZ XXXX"` en PDFs
+- `detectar_fila_encabezado` incluye "unidad" pero `EQUIVALENCIAS_COLUMNAS` no lo mapea (inconsistencia)
+- `_asignar_dif_var_posicional` frágil con columnas extra sin nombre
+
+---
+
+## Mejora de diagnóstico aplicada
+
+`filtrar_formato_clave()` ahora loguea en WARNING exactamente qué columna falla y una muestra de los valores problemáticos:
+```
+[WARNING] filtrar_formato_clave: 9 fila(s) descartadas.
+          Columnas con error: ['DIF'].
+          Muestra: [{'GPO': '010', 'GEN': '000', 'ESP': '3047', 'DIF': '0.0', 'VAR': '00'}, ...]
+```
+Esto facilita diagnosticar futuros formatos de tabla no reconocidos sin necesidad de depurar en código.
+
+---
+
+## Historial de arranques del monitor (2026-06-01)
+
+| Hora | PID | Motivo |
+|------|-----|--------|
+| 10:06 | 36860 | Arranque inicial del día |
+| 10:21 | — | Reinicio tras correcciones (bugs 1-4) |
+| 10:30 | — | Reprocesar UMF 24 AMECA |
+| 10:41 | — | Reprocesar fix hash HGZ 14 |
+| 10:54 | — | Reprocesar fix expediente/firmas/fallback/limpiar |
+| 11:52 | — | Reprocesar fix SOLICIT |
+| 13:19 | 12144 | Arranque final del día — monitor estable |
