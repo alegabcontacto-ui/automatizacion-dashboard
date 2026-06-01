@@ -59,6 +59,15 @@ COLUMNAS_FINALES = [
 ]
 
 INTERVALO_MONITOREO = int(getenv("INTERVALO_MONITOREO", 120))
+# Ventana (segundos) para considerar dos correos como la misma cotización.
+# Se mide contra la FECHA DE RECEPCIÓN de los correos, no el reloj: dos correos
+# del mismo remitente con las mismas claves+cantidades recibidos dentro de esta
+# ventana se tratan como duplicados (mismo requerimiento llegado a varios buzones,
+# o eco reciente del hilo). Pedidos genuinos del mismo contenido separados por más
+# de esta ventana se cotizan por separado.
+# 600s = 10 min: el remitente IMSS suele enviar el mismo correo a varios buzones
+# (ventas@ y contacto@) con hasta ~10 min de diferencia.
+VENTANA_DEDUP_SEGUNDOS = int(getenv("VENTANA_DEDUP_SEGUNDOS", 600))
 ESTADO_FILE = Path("estado_procesamiento.json")
 LOG_FILE    = "cotizaciones.log"
 
@@ -97,7 +106,7 @@ def cargar_estado() -> dict:
                 return json.load(f)
         except Exception as e:
             log.warning(f"No se pudo leer estado previo: {e}")
-    return {"ids_procesados": [], "ultima_fecha": None}
+    return {"ids_procesados": [], "ultima_fecha": None, "firmas_enviadas": {}}
 
 
 def guardar_estado(estado: dict):
@@ -184,6 +193,25 @@ def generar_clave(gpo, gen, esp, dif, var) -> str:
     return f"{gpo}.{gen}.{esp}.{dif}.{var}"
 
 
+def firma_cotizacion(remitente_real: str, df: pd.DataFrame) -> str:
+    """Hash estable de (remitente + conjunto de claves+cantidades) para deduplicar
+    cotizaciones idénticas que llegan a varios buzones o como eco reciente del hilo."""
+    items = sorted(
+        f"{r['GPO']}.{r['GEN']}.{r['ESP']}.{r['DIF']}.{r['VAR']}={r['CANTIDAD']}"
+        for _, r in df.iterrows()
+    )
+    base = (remitente_real or "") + "|" + "|".join(items)
+    return hashlib.md5(base.encode()).hexdigest()
+
+
+def _firma_vigente(ts_iso: str, ahora: datetime) -> bool:
+    """True si la firma (por fecha de recepción) sigue dentro de la ventana de dedup."""
+    try:
+        return (ahora - datetime.fromisoformat(ts_iso)).total_seconds() < VENTANA_DEDUP_SEGUNDOS
+    except (ValueError, TypeError):
+        return False
+
+
 # ─────────────────────────────────────────────
 #  MYSQL
 # ─────────────────────────────────────────────
@@ -233,6 +261,15 @@ def asegurar_tablas_mysql(conn):
             log.info("Columna remitente_imss agregada a correos_procesados.")
         except Exception:
             pass  # ya existe
+        # Asegurar que `estado` acepte cualquier etiqueta (incl. 'duplicado').
+        # Si la tabla se creó con un ENUM antiguo, esto lo convierte a VARCHAR.
+        try:
+            cursor.execute(
+                "ALTER TABLE correos_procesados "
+                "MODIFY COLUMN estado VARCHAR(50) DEFAULT 'procesando'"
+            )
+        except Exception:
+            pass
         conn.commit()
         log.info("Tabla correos_procesados verificada.")
     except Exception as e:
@@ -955,17 +992,20 @@ def conectar_outlook():
 
 def procesar_correos(inbox, conn, ids_procesados: set, ultima_fecha,
                      fecha_desde: datetime = None, fecha_hasta: datetime = None,
-                     reprocesar: bool = False):
+                     reprocesar: bool = False, firmas_enviadas: dict = None):
     conn = asegurar_mysql(conn)
     messages = inbox.Items
     messages.Sort("[ReceivedTime]", True)
 
+    if firmas_enviadas is None:
+        firmas_enviadas = {}
+
     correos_validos    = 0
     correos_con_tabla  = 0
     total_insertadas   = 0
+    correos_duplicados = 0
     nueva_ultima_fecha = ultima_fecha
     resultados_csv     = []
-    firmas_cotizadas   = set()
 
     for message in messages:
         entry_id       = None
@@ -1028,6 +1068,30 @@ def procesar_correos(inbox, conn, ids_procesados: set, ultima_fecha,
                 ids_procesados.add(entry_id)
                 continue
 
+            # Deduplicación: ¿ya se cotizó este mismo requerimiento (remitente +
+            # claves + cantidades) dentro de la ventana? Cubre el mismo correo
+            # llegado a varios buzones y ecos recientes del hilo. Se compara contra
+            # la fecha de recepción del correo original, no el reloj.
+            firma = firma_cotizacion(remitente_real, df_correo)
+            ts_previo = firmas_enviadas.get(firma)
+            if ts_previo:
+                try:
+                    dt_previo = datetime.fromisoformat(ts_previo)
+                    delta = abs((fecha_correo_cmp - dt_previo).total_seconds())
+                    if delta < VENTANA_DEDUP_SEGUNDOS:
+                        correos_duplicados += 1
+                        log.info(
+                            f"DUPLICADO omitido — mismo remitente/claves/cantidades a "
+                            f"{int(delta)}s del original (ventana {VENTANA_DEDUP_SEGUNDOS}s). "
+                            f"No se inserta en MySQL ni se envía PDF."
+                        )
+                        actualizar_correo_estado(conn, entry_id, 'duplicado', filas_brutas,
+                                                 remitente_imss=remitente_real)
+                        ids_procesados.add(entry_id)
+                        continue
+                except ValueError:
+                    pass
+
             expediente = generar_expediente(conn, fecha_correo)
             expediente_usado = False
             try:
@@ -1063,6 +1127,9 @@ def procesar_correos(inbox, conn, ids_procesados: set, ultima_fecha,
                         log.error(f"Error insertando en MySQL: {e}", exc_info=True)
 
                 expediente_usado = True
+                # Registrar la firma con la fecha de recepción del correo: los
+                # duplicados posteriores dentro de la ventana se omitirán por completo.
+                firmas_enviadas[firma] = fecha_correo_cmp.isoformat()
                 actualizar_correo_estado(
                     conn, entry_id, 'completado',
                     len(df_correo), filas_insertadas_correo, expediente,
@@ -1071,15 +1138,10 @@ def procesar_correos(inbox, conn, ids_procesados: set, ultima_fecha,
                 ids_procesados.add(entry_id)
 
                 if COTIZACION_DISPONIBLE:
-                    firma = (remitente_real, frozenset(
-                        (row["CLAVE"], str(row["CANTIDAD"])) for _, row in df_correo.iterrows()
-                    ))
-                    if firma not in firmas_cotizadas:
-                        firmas_cotizadas.add(firma)
-                        try:
-                            generar_y_enviar_cotizacion(message, df_correo, asunto, fecha_correo)
-                        except Exception as e_cot:
-                            log.error(f"Error generando cotización: {e_cot}", exc_info=True)
+                    try:
+                        generar_y_enviar_cotizacion(message, df_correo, asunto, fecha_correo)
+                    except Exception as e_cot:
+                        log.error(f"Error generando cotización: {e_cot}", exc_info=True)
 
             except Exception as e_inner:
                 if not expediente_usado:
@@ -1099,7 +1161,8 @@ def procesar_correos(inbox, conn, ids_procesados: set, ultima_fecha,
 
     log.info(
         f"Ciclo terminado — válidos: {correos_validos} | "
-        f"con tabla: {correos_con_tabla} | MySQL: {total_insertadas}"
+        f"con tabla: {correos_con_tabla} | duplicados: {correos_duplicados} | "
+        f"MySQL: {total_insertadas}"
     )
     return ids_procesados, nueva_ultima_fecha, conn
 
@@ -1143,6 +1206,7 @@ def main():
             procesar_correos(
                 inbox, conn, set(), None,
                 fecha_desde=fecha_desde, fecha_hasta=fecha_hasta, reprocesar=True,
+                firmas_enviadas={},
             )
         finally:
             if conn and MYSQL_DISPONIBLE:
@@ -1154,9 +1218,10 @@ def main():
                     pass
         return
 
-    estado         = cargar_estado()
-    ids_procesados = set(estado.get("ids_procesados", []))
-    ultima_fecha   = None
+    estado          = cargar_estado()
+    ids_procesados  = set(estado.get("ids_procesados", []))
+    firmas_enviadas = dict(estado.get("firmas_enviadas", {}))
+    ultima_fecha    = None
 
     if estado.get("ultima_fecha"):
         try:
@@ -1169,11 +1234,19 @@ def main():
         while True:
             log.info(f"\n⏱  [{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Revisando correos nuevos...")
             ids_procesados, ultima_fecha, conn = procesar_correos(
-                inbox, conn, ids_procesados, ultima_fecha
+                inbox, conn, ids_procesados, ultima_fecha,
+                firmas_enviadas=firmas_enviadas,
             )
+            # Podar firmas cuya fecha de recepción ya salió de la ventana de dedup
+            ahora = datetime.now()
+            firmas_enviadas = {
+                h: ts for h, ts in firmas_enviadas.items()
+                if _firma_vigente(ts, ahora)
+            }
             guardar_estado({
                 "ids_procesados": list(ids_procesados),
                 "ultima_fecha": ultima_fecha.isoformat() if ultima_fecha else None,
+                "firmas_enviadas": firmas_enviadas,
             })
             log.info(f"Próxima revisión en {INTERVALO_MONITOREO}s. (Ctrl+C para detener)\n")
             time.sleep(INTERVALO_MONITOREO)

@@ -131,13 +131,28 @@ El parser maneja dos modos:
 
 ---
 
-## Deduplicación de cotizaciones
+## Deduplicación de cotizaciones (persistente, ventana 10 min)
 
-La firma que evita enviar dos PDFs al mismo destinatario por el mismo requerimiento:
+Evita procesar dos veces el mismo requerimiento. Cubre dos escenarios:
+1. **Mismo correo a varios buzones** — el mismo remitente IMSS (ej. juanperez@imss.gob.mx) envía las mismas claves+cantidades a `ventas@` y `contacto@` con hasta ~10 min de diferencia. Solo se cotiza una vez. *(Antes el flujo lo trataba como 2 cotizaciones distintas y enviaba el PDF dos veces al correo de prueba.)*
+2. **Eco reciente del hilo** — alguien de ventas responde el hilo re-conteniendo una cotización vieja. Si llegó dentro de la ventana, se omite.
+
+**Cómo funciona:**
 ```python
-firma = (remitente_real, frozenset((clave, cantidad) for cada fila))
+firma = md5(remitente_real + "|" + sorted("gpo.gen.esp.dif.var=cantidad"))
 ```
-Incluye cantidad → mismas claves con cantidades distintas generan cotizaciones separadas.
+- La firma se guarda en `estado_procesamiento.json` → `firmas_enviadas` con la **fecha de recepción** del correo original (persiste entre ciclos).
+- Antes de insertar/enviar, se compara la firma del correo nuevo contra las guardadas. Si coincide y la diferencia de fechas de recepción es **< `VENTANA_DEDUP_SEGUNDOS` (600s = 10 min)** → es duplicado.
+- **Un duplicado se omite por completo:** no genera expediente, no inserta en MySQL, no envía PDF. Se marca como `'duplicado'` en `correos_procesados`.
+
+**Por qué la ventana se mide contra la fecha de recepción y no el reloj:**
+Durante un reprocesar de día completo, todos los correos se procesan en segundos. Si se usara el reloj, dos pedidos genuinos de las mismas claves separados por horas se verían como duplicados. Usando la fecha de recepción del correo, solo los que realmente llegaron juntos (< 5 min) se deduplican.
+
+**Configuración:** variable de entorno `VENTANA_DEDUP_SEGUNDOS` (default 600 = 10 min).
+
+**Limitación conocida:** un eco que llega **más de 10 minutos** después del original NO se detecta (el escenario 2 menciona ecos de "horas o días"). Para cubrir esos casos hay que aumentar `VENTANA_DEDUP_SEGUNDOS` o cambiar a deduplicación permanente.
+
+> Nota: como el inbox se ordena por fecha descendente (más nuevo primero), ante duplicados se conserva el correo más reciente y se omite el anterior. El contenido (claves+cantidades) es idéntico, así que la cotización resultante es la misma.
 
 ---
 
