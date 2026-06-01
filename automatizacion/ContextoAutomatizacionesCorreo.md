@@ -154,6 +154,22 @@ Durante un reprocesar de día completo, todos los correos se procesan en segundo
 
 > Nota: como el inbox se ordena por fecha descendente (más nuevo primero), ante duplicados se conserva el correo más reciente y se omite el anterior. El contenido (claves+cantidades) es idéntico, así que la cotización resultante es la misma.
 
+**Importante — la dedup NO está atada a ningún remitente específico:**
+La firma usa `remitente_real` extraído dinámicamente de cada correo (línea "De: ...@imss.gob.mx" del cuerpo). Aplica igual para cualquier funcionario IMSS — no hay direcciones hardcodeadas. La regla es genérica: mismo remitente (sea quien sea) + mismas claves + mismas cantidades + dentro de 10 min → duplicado.
+
+**Ciclo de vida de la firma:**
+- Se registra en `firmas_enviadas` con la fecha de recepción del correo original.
+- Al final de cada ciclo se poda: firmas con más de 10 min de antigüedad se eliminan del JSON.
+- Esto mantiene el archivo pequeño y evita falsos positivos en pedidos futuros del mismo contenido.
+
+**Resultado verificado en producción (reprocesar 2026-06-01):**
+5 duplicados correctamente detectados y omitidos:
+- COTIZACION 18022610 → a 0s del original
+- SOLICITUD FARM 01 JUNIO → a 76s del original
+- UMF 57 → a 53s del original
+- HGZ 14 → a 6s del original
+- UMF 55 → a 200s del original
+
 ---
 
 ## Expediente
@@ -367,4 +383,46 @@ Esto facilita diagnosticar futuros formatos de tabla no reconocidos sin necesida
 | 10:41 | — | Reprocesar fix hash HGZ 14 |
 | 10:54 | — | Reprocesar fix expediente/firmas/fallback/limpiar |
 | 11:52 | — | Reprocesar fix SOLICIT |
-| 13:19 | 12144 | Arranque final del día — monitor estable |
+| 13:19 | 12144 | Arranque tras contexto guardado en MD |
+| 16:49 | — | Reprocesar con deduplicación activa (test) — 5 duplicados detectados |
+| 16:52 | — | Reprocesar confirmación fix columna estado VARCHAR |
+| ~17:00 | 20216 | Arranque con dedup 5 min |
+| ~17:10 | 11964 | Reinicio con dedup ampliada a 10 min |
+
+---
+
+## Repositorio Git
+
+- **Remote:** `https://github.com/alegabcontacto-ui/automatizacion-dashboard.git`
+- **Rama principal:** `main`
+
+### Historial de commits relevantes
+
+| Hash | Mensaje |
+|------|---------|
+| `030d6ee` | feat: deduplicacion persistente de cotizaciones y mejoras de robustez |
+| `add6827` | docs: actualizar contexto operativo de automatizacion |
+| `19457ce` | feat: mejorar robustez en expedientes, parsing de tablas y contexto |
+| `4e47f2d` | docs: agregar README, requirements y template de usuarios |
+| `01e691f` | feat: commit inicial - automatizacion y dashboard IMSS |
+
+### Qué incluye el commit `030d6ee`
+Todo lo trabajado en la sesión 2026-06-01:
+- Deduplicación persistente (ventana 10 min, basada en fecha de recepción)
+- 9 bugs corregidos (GEN→ESP, DIF float, CANTIDAD clave, hash, firmas, fallback expediente, correos_procesados, expediente quemado, SOLICIT)
+- Columna `estado` en `correos_procesados` ampliada a VARCHAR(50)
+- Contexto completo en `ContextoAutomatizacionesCorreo.md`
+
+### Comandos útiles de git
+```bash
+# Ver estado actual
+git status
+
+# Ver últimos commits
+git log --oneline -5
+
+# Subir cambios
+git add main.py ContextoAutomatizacionesCorreo.md
+git commit -m "descripcion"
+git push origin main
+```
