@@ -59,15 +59,10 @@ COLUMNAS_FINALES = [
 ]
 
 INTERVALO_MONITOREO = int(getenv("INTERVALO_MONITOREO", 120))
-# Ventana (segundos) para considerar dos correos como la misma cotización.
-# Se mide contra la FECHA DE RECEPCIÓN de los correos, no el reloj: dos correos
-# del mismo remitente con las mismas claves+cantidades recibidos dentro de esta
-# ventana se tratan como duplicados (mismo requerimiento llegado a varios buzones,
-# o eco reciente del hilo). Pedidos genuinos del mismo contenido separados por más
-# de esta ventana se cotizan por separado.
-# 600s = 10 min: el remitente IMSS suele enviar el mismo correo a varios buzones
-# (ventas@ y contacto@) con hasta ~10 min de diferencia.
-VENTANA_DEDUP_SEGUNDOS = int(getenv("VENTANA_DEDUP_SEGUNDOS", 600))
+# Dedup por día calendario: si el mismo remitente manda las mismas claves+cantidades
+# más de una vez en el mismo día, solo se procesa el primer correo. Cubre tanto
+# el mismo correo llegado a varios buzones como reenvíos/respuestas del hilo en
+# el transcurso del día. Pedidos del mismo contenido en días distintos sí se cotizan.
 ESTADO_FILE = Path("estado_procesamiento.json")
 LOG_FILE    = "cotizaciones.log"
 
@@ -210,9 +205,9 @@ def firma_cotizacion(remitente_real: str, df: pd.DataFrame) -> str:
 
 
 def _firma_vigente(ts_iso: str, ahora: datetime) -> bool:
-    """True si la firma (por fecha de recepción) sigue dentro de la ventana de dedup."""
+    """True si la firma es del mismo día calendario que ahora."""
     try:
-        return (ahora - datetime.fromisoformat(ts_iso)).total_seconds() < VENTANA_DEDUP_SEGUNDOS
+        return datetime.fromisoformat(ts_iso).date() == ahora.date()
     except (ValueError, TypeError):
         return False
 
@@ -1098,21 +1093,18 @@ def procesar_correos(inbox, conn, ids_procesados: set, ultima_fecha,
                 ids_procesados.add(entry_id)
                 continue
 
-            # Deduplicación: ¿ya se cotizó este mismo requerimiento (remitente +
-            # claves + cantidades) dentro de la ventana? Cubre el mismo correo
-            # llegado a varios buzones y ecos recientes del hilo. Se compara contra
-            # la fecha de recepción del correo original, no el reloj.
+            # Deduplicación por día: si el mismo remitente ya fue cotizado hoy con
+            # las mismas claves+cantidades, omitir sin importar la hora del día.
             firma = firma_cotizacion(remitente_real, df_correo)
             ts_previo = firmas_enviadas.get(firma)
             if ts_previo:
                 try:
                     dt_previo = datetime.fromisoformat(ts_previo)
-                    delta = abs((fecha_correo_cmp - dt_previo).total_seconds())
-                    if delta < VENTANA_DEDUP_SEGUNDOS:
+                    if fecha_correo_cmp.date() == dt_previo.date():
                         correos_duplicados += 1
                         log.info(
-                            f"DUPLICADO omitido — mismo remitente/claves/cantidades a "
-                            f"{int(delta)}s del original (ventana {VENTANA_DEDUP_SEGUNDOS}s). "
+                            f"DUPLICADO omitido — mismo remitente/claves/cantidades "
+                            f"ya procesado hoy a las {dt_previo.strftime('%H:%M')}. "
                             f"No se inserta en MySQL ni se envía PDF."
                         )
                         actualizar_correo_estado(conn, entry_id, 'duplicado', filas_brutas,
