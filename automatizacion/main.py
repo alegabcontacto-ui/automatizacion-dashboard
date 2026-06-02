@@ -143,8 +143,9 @@ def generar_expediente(conn, fecha: datetime) -> str:
 
     cursor = conn.cursor()
     try:
+        conn.start_transaction()
         cursor.execute(
-            "SELECT consecutivo FROM expediente_consecutivo WHERE fecha = %s",
+            "SELECT consecutivo FROM expediente_consecutivo WHERE fecha = %s FOR UPDATE",
             (fecha_hoy,)
         )
         row = cursor.fetchone()
@@ -163,6 +164,10 @@ def generar_expediente(conn, fecha: datetime) -> str:
         conn.commit()
     except Exception as e:
         log.warning(f"Error generando expediente: {e}")
+        try:
+            conn.rollback()
+        except Exception:
+            pass
         consecutivo = 1
     finally:
         cursor.close()
@@ -270,8 +275,33 @@ def asegurar_tablas_mysql(conn):
             )
         except Exception:
             pass
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS cotizaciones (
+                id           INT AUTO_INCREMENT PRIMARY KEY,
+                expediente   VARCHAR(100),
+                partida      INT,
+                gpo          VARCHAR(3),
+                gen          VARCHAR(3),
+                esp          VARCHAR(4),
+                dif          VARCHAR(2),
+                var          VARCHAR(2),
+                cantidad     INT,
+                clave        VARCHAR(20),
+                asunto       VARCHAR(500),
+                remitente    VARCHAR(255),
+                fecha_correo DATETIME,
+                entry_id     VARCHAR(32) UNIQUE,
+                creado_en    DATETIME DEFAULT CURRENT_TIMESTAMP
+            ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci
+        """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS expediente_consecutivo (
+                fecha        DATE PRIMARY KEY,
+                consecutivo  INT NOT NULL DEFAULT 1
+            ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci
+        """)
         conn.commit()
-        log.info("Tabla correos_procesados verificada.")
+        log.info("Tablas MySQL verificadas.")
     except Exception as e:
         log.warning(f"asegurar_tablas_mysql: {e}")
     finally:
@@ -1023,7 +1053,7 @@ def procesar_correos(inbox, conn, ids_procesados: set, ultima_fecha,
             else:
                 if entry_id in ids_procesados:
                     continue
-                if ultima_fecha and fecha_correo <= ultima_fecha:
+                if ultima_fecha and fecha_correo_cmp <= ultima_fecha:
                     break
 
             asunto          = str(message.Subject)
@@ -1037,8 +1067,8 @@ def procesar_correos(inbox, conn, ids_procesados: set, ultima_fecha,
             registrar_correo_inicio(conn, entry_id, asunto, remitente_buzon, fecha_correo)
             remitente_real = extraer_remitente_original(message)
 
-            if nueva_ultima_fecha is None or fecha_correo > nueva_ultima_fecha:
-                nueva_ultima_fecha = fecha_correo
+            if nueva_ultima_fecha is None or fecha_correo_cmp > nueva_ultima_fecha:
+                nueva_ultima_fecha = fecha_correo_cmp
 
             log.info("=" * 60)
             log.info(f"CORREO VÁLIDO #{correos_validos}")
