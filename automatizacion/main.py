@@ -1248,6 +1248,7 @@ def main():
     if estado.get("ultima_fecha"):
         try:
             ultima_fecha = datetime.fromisoformat(estado["ultima_fecha"])
+            ultima_fecha = ultima_fecha.replace(tzinfo=None)
             log.info(f"Retomando desde: {ultima_fecha}")
         except ValueError:
             log.warning("Fecha en estado inválida, procesando desde el inicio.")
