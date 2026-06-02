@@ -426,3 +426,60 @@ git add main.py ContextoAutomatizacionesCorreo.md
 git commit -m "descripcion"
 git push origin main
 ```
+
+---
+
+## Auditoría post-fixes — 2026-06-02
+
+Commit aplicado: `3c6bc68` (tres fixes críticos implementados por Claude Code).  
+Fixes importantes implementados por el usuario de forma independiente.
+
+### ✅ OK — verificado en código
+
+**`generar_expediente` — `SELECT ... FOR UPDATE`**
+`conn.start_transaction()` antes del SELECT, `FOR UPDATE` en la query, `conn.rollback()` en el except, `cursor.close()` en `finally`. Cubre row lock en fila existente y gap lock de InnoDB en primera inserción del día. Correcto para multi-proceso.
+
+**Comparación fechas naive vs aware**
+`fecha_correo_cmp` (tzinfo=None) usado consistentemente en las tres comparaciones: línea 1056 (`break` por `ultima_fecha`), línea 1070 (comparación `nueva_ultima_fecha`), línea 1071 (asignación `nueva_ultima_fecha`). El JSON siempre guarda y lee naive. Ciclo consistente.
+
+**Auto-creación tablas `cotizaciones` y `expediente_consecutivo`**
+Ambas en `asegurar_tablas_mysql`. Schema de `cotizaciones` coincide exactamente con `insertar_filas`: `entry_id VARCHAR(32) UNIQUE` activa el `ON DUPLICATE KEY UPDATE`, `cantidad INT` acepta los `None` que genera línea 376.
+
+---
+
+### ❌ Sigue mal — pendiente de fix
+
+| # | Problema | Ubicación |
+|---|---|---|
+| 3 | `ids_procesados` crece sin límite en JSON, sin purga por fecha | línea 1276 |
+| 6 | Cursores sin `finally` en `registrar_correo_inicio`, `actualizar_correo_estado`, `insertar_filas` | líneas 416, 442, 362 |
+| 8 | Sin `Restrict` de Outlook — itera todo el inbox cada ciclo | líneas 1027-1028 |
+| 9 | Sin límite de tamaño de adjuntos (`att.Size` no verificado) | línea 958 |
+| 10 | Sin reconexión COM — `COMError` de Outlook crashea el proceso sin recuperación | línea 1027 |
+
+---
+
+### ⚠️ Riesgos nuevos introducidos por los fixes
+
+**`conn.rollback()` en `generar_expediente` puede revertir un INSERT pendiente de `registrar_correo_inicio`**
+
+Si `registrar_correo_inicio` ejecuta su `cursor.execute()` con éxito pero su `conn.commit()` falla (ventana de red microscópica), la transacción queda abierta sin commit. Cuando `generar_expediente` llama `conn.start_transaction()`, InnoDB lanza `InternalError: already in transaction`. El except llama `conn.rollback()`, que revierte el INSERT staged de `correos_procesados`. El correo no queda en auditoría. Impacto bajo con MySQL local.
+
+**`ultima_fecha` en JSON existente puede ser offset-aware**
+
+Si el archivo `estado_procesamiento.json` fue escrito por el código anterior al fix (que guardaba `fecha_correo` directamente con timezone), el campo `ultima_fecha` podría contener `"2026-06-01T10:30:00+06:00"`. `datetime.fromisoformat()` preserva el offset, devolviendo un datetime aware. La comparación `fecha_correo_cmp <= ultima_fecha` (naive <= aware) seguiría lanzando `TypeError`.
+
+**Acción requerida:** verificar `estado_procesamiento.json`. Si `ultima_fecha` contiene `+` o `Z`, borrar ese campo o el archivo antes de arrancar.
+
+---
+
+### Pruebas recomendadas
+
+| Ítem | Prueba |
+|---|---|
+| `FOR UPDATE` atómico | Ejecutar dos instancias simultáneas y verificar en MySQL que no hay expedientes duplicados en `cotizaciones`. |
+| Timezone en JSON | Abrir `estado_procesamiento.json` y revisar si `ultima_fecha` contiene `+` o `Z`. Si sí, limpiar el campo. |
+| Tablas auto-creadas | `DROP TABLE IF EXISTS cotizaciones; DROP TABLE IF EXISTS expediente_consecutivo;` → reiniciar monitor → `SHOW TABLES;` |
+| Leak de cursores | `SHOW PROCESSLIST` antes y después de 10 ciclos; el número de conexiones `Sleep` no debe crecer. |
+| Crash COM | Cerrar Outlook a mano mientras el monitor corre y esperar al siguiente ciclo. Verificar si el proceso muere o recupera. |
+| Crecimiento JSON | Revisar tamaño de `estado_procesamiento.json` después de una semana. Si supera 1 MB, el fix de purga sigue pendiente. |
